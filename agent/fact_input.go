@@ -12,9 +12,13 @@ import (
 const factWhitespace = "\t\n\v\f\r \u0085   -     　"
 
 func factAssetIDSchema() map[string]any {
+	// Union type kept (models send both 2 and "2"; the handler and schema
+	// validation accept both), but NO pattern/minimum: Alibaba's Qwen serving
+	// via OpenRouter rejects a union type combined with a pattern constraint
+	// in function schemas — invalid_parameter_error on every call carrying
+	// record_fact. Runtime ID parsing (pid) still trims and coerces strings.
 	return map[string]any{
-		"type": []string{"integer", "string"}, "minimum": 1,
-		"pattern": "^[" + factWhitespace + "]*\\+?0*[1-9][0-9]*[" + factWhitespace + "]*$",
+		"type": []string{"integer", "string"},
 	}
 }
 

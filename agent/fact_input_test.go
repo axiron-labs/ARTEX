@@ -170,11 +170,25 @@ func TestRecordFactSchemaMatchesStrings(t *testing.T) {
 			t.Errorf("summary %q: schema=%v runtime=%v", value, got, want)
 		}
 	}
-	id := regexp.MustCompile(factAssetIDSchema()["pattern"].(string))
-	for _, value := range []string{"1", "001", "+1", " +001 ", "\u200312\u3000", "", "0", "-1", "1.5", "a"} {
+	idSchema := factAssetIDSchema()
+	if types, ok := idSchema["type"].([]string); !ok || len(types) != 2 {
+		t.Fatalf("asset ID schema must stay an integer/string union for numeric-string compatibility: %v", idSchema["type"])
+	}
+	if _, has := idSchema["pattern"]; has {
+		t.Fatal("asset ID schema must not carry a pattern: Alibaba rejects union type + pattern in function schemas")
+	}
+	// The published schema no longer carries a pattern; runtime pid parsing
+	// keeps accepting trimmed/coerced string IDs and rejecting invalid ones.
+	for _, value := range []string{"1", "001", "+1", " +001 ", "\u200312\u3000"} {
 		raw, _ := json.Marshal(value)
-		if got, want := id.MatchString(value), pid(raw) > 0; got != want {
-			t.Errorf("asset ID %q: schema=%v runtime=%v", value, got, want)
+		if pid(raw) <= 0 {
+			t.Errorf("asset ID %q: runtime parse rejected a valid ID", value)
+		}
+	}
+	for _, value := range []string{"", "0", "-1", "1.5", "a"} {
+		raw, _ := json.Marshal(value)
+		if pid(raw) > 0 {
+			t.Errorf("asset ID %q: runtime parse accepted an invalid ID", value)
 		}
 	}
 	for _, input := range []string{
