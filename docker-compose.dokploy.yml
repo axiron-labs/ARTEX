@@ -1,0 +1,133 @@
+# ARTEX on Axiron (Dokploy compose, tailnet-only).
+#
+# Follows the host's established sidecar pattern (see CLIProxyAPI / authentik
+# stacks): the app shares the Tailscale container's network namespace, nothing
+# is published on host ports, and HTTPS reaches the UI only through Tailscale
+# Serve at https://<TS_HOSTNAME>.<tailnet>. Funnel is explicitly disabled.
+#
+# Dokploy env (compose env, not a committed .env):
+#   POSTGRES_PASSWORD  required, raw password (ARTEX percent-encodes it)
+#   TS_AUTHKEY         required on first boot, reusable tailnet auth key
+#   TS_HOSTNAME        optional, defaults to "artex"
+#   ARTEX_VERSION      optional build version stamp
+#   LLM keys/profiles  optional; can also be configured in System -> LLM
+#
+# The default network uses an explicit small subnet because the host's Docker
+# address pools are exhausted; 10.213.48.16/28 is the next free slot after the
+# authentik stack's 10.213.48.0/28.
+
+services:
+  postgres:
+    image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-artex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the Dokploy compose env}
+      POSTGRES_DB: ${POSTGRES_DB:-artex}
+      # SCRAM for every TCP connection from another container (see upstream
+      # docker-compose.yml); applied when the pgdata volume is first initialised.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-artex} -d $${POSTGRES_DB:-artex}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  artex:
+    build:
+      context: .
+      args:
+        ARTEX_VERSION: ${ARTEX_VERSION:-v0.7.0-axiron}
+    image: artex:axiron
+    # Agent processes run as an unprivileged executor: no setuid program or file
+    # capability may raise them back to root (same as upstream compose).
+    security_opt:
+      - "no-new-privileges:true"
+    # Shares the sidecar's netns: reachable only via the tailnet (Serve HTTPS on
+    # 443, and the raw ports on the node's tailnet IP). No host ports.
+    network_mode: service:tailscale
+    depends_on:
+      postgres:
+        condition: service_healthy
+      tailscale:
+        condition: service_started
+    environment:
+      ARTEX_PG_HOST: postgres
+      ARTEX_PG_PORT: "5432"
+      ARTEX_PG_USER: ${POSTGRES_USER:-artex}
+      ARTEX_PG_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the Dokploy compose env}
+      ARTEX_PG_DBNAME: ${POSTGRES_DB:-artex}
+      ARTEX_PG_SSLMODE: disable
+      ARTEX_JWT_KEY_DIR: /app/keys
+      # LLM: leave empty and configure in System -> LLM, or set here.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ARTEX_LLM_PROVIDER: ${ARTEX_LLM_PROVIDER:-}
+      ARTEX_LLM_MODEL: ${ARTEX_LLM_MODEL:-}
+      ARTEX_LLM_BASE_URL: ${ARTEX_LLM_BASE_URL:-}
+      ARTEX_LLM_PROXY: ${ARTEX_LLM_PROXY:-}
+      ARTEX_LLM_PRIVATE_ENDPOINTS: ${ARTEX_LLM_PRIVATE_ENDPOINTS:-}
+      # Optional key for secrets at rest; empty = keys/secret.key in the volume.
+      ARTEX_SECRET_KEY: ${ARTEX_SECRET_KEY:-}
+      ARTEX_TRUSTED_PROXIES: ${ARTEX_TRUSTED_PROXIES:-}
+      ARTEX_UNTRUSTED_BOUNDARY: ${ARTEX_UNTRUSTED_BOUNDARY:-}
+      ARTEX_UPDATE_CHECK: ${ARTEX_UPDATE_CHECK:-}
+      ARTEX_NOISE_PROFILE: ${ARTEX_NOISE_PROFILE:-}
+      ARTEX_TARGET_USER_AGENT: ${ARTEX_TARGET_USER_AGENT:-}
+      ARTEX_TASK_BUDGET_TOKENS: ${ARTEX_TASK_BUDGET_TOKENS:-}
+      ARTEX_TASK_BUDGET_TURNS: ${ARTEX_TASK_BUDGET_TURNS:-}
+      ARTEX_INTENT_BUDGET_TOKENS: ${ARTEX_INTENT_BUDGET_TOKENS:-}
+      ARTEX_INTENT_BUDGET_TURNS: ${ARTEX_INTENT_BUDGET_TURNS:-}
+    volumes:
+      # Named volumes (not bind mounts): traffic blobs, transcripts, task files,
+      # and the JWT/secret keys survive rebuilds and stay out of the repo.
+      - artex-data:/app/data
+      - artex-keys:/app/keys
+    restart: unless-stopped
+
+  tailscale:
+    image: tailscale/tailscale:v1.104.4
+    hostname: ${TS_HOSTNAME:-artex}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?Set TS_AUTHKEY in the Dokploy compose env}
+      TS_HOSTNAME: ${TS_HOSTNAME:-artex}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"
+      TS_AUTH_ONCE: "true"
+      TS_ACCEPT_DNS: "false"
+      TS_BOOT_TIMEOUT: 24h
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
+    volumes:
+      - ts-state:/var/lib/tailscale
+    configs:
+      - source: serve
+        target: /config/serve.json
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9002/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  artex-data:
+  artex-keys:
+  ts-state:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.213.48.16/28
+
+configs:
+  serve:
+    # $$ escapes compose interpolation; the sidecar expands TS_CERT_DOMAIN to
+    # its own MagicDNS name. No Funnel: tailnet-only.
+    content: '{"TCP": {"443": {"HTTPS": true}}, "Web": {"$${TS_CERT_DOMAIN}:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}}}}, "AllowFunnel": {"$${TS_CERT_DOMAIN}:443": false}}'
